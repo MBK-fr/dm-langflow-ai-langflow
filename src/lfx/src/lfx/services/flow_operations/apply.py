@@ -8,11 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from lfx.services.flow_operations.exceptions import (
-    FlowDataValidationError,
-    FlowOperationError,
-    FlowOperationValidationError,
-)
+from lfx.services.flow_operations.canonical import json_type
+from lfx.services.flow_operations.exceptions import FlowOperationValidationError
 from lfx.services.flow_operations.ops import (
     GRAPH_COLLECTION_KEYS,
     AddEdgesOp,
@@ -30,6 +27,7 @@ from lfx.services.flow_operations.ops import (
     deduplicate_delete_ids,
     normalize_requested_ops,
 )
+from lfx.services.flow_operations.validation import NODE_OBJECT_PATHS, validate_flow_data
 
 
 @dataclass(frozen=True)
@@ -54,14 +52,6 @@ class GraphState:
     # Base-flow node ids whose payload has already been copied before mutation.
     copied_base_flow_node_ids: set[str] = field(default_factory=set)
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.flow_data.get("nodes"), list):
-            msg = "flow.data.nodes must be a list"
-            raise FlowDataValidationError(msg)
-        if not isinstance(self.flow_data.get("edges"), list):
-            msg = "flow.data.edges must be a list"
-            raise FlowDataValidationError(msg)
-
     @property
     def nodes(self) -> list[Any]:
         return self.flow_data["nodes"]
@@ -72,25 +62,21 @@ class GraphState:
 
 
 def build_graph_state(base_flow: dict[str, Any]) -> GraphState:
-    """Shallow-copy flow.data and index graph payloads by reference."""
+    """Validate flow.data, shallow-copy it, and index graph payloads by reference.
+
+    Values are not walked for NaN here: that check belongs to whoever accepts
+    a graph from outside, and skipping it keeps each apply proportional to the
+    number of nodes and edges rather than to the size of the flow.
+    """
+    validate_flow_data(base_flow, check_values=False)
     state = GraphState(flow_data=dict(base_flow), edge_ids_by_node_id=defaultdict(set))
     for node in state.nodes:
-        node_id = _require_node_id(node, context="flow.data.nodes", error_cls=FlowDataValidationError)
-        if node_id in state.nodes_by_id:
-            msg = f"flow.data.nodes: duplicate node id: {node_id!r}"
-            raise FlowDataValidationError(msg)
+        node_id = node["id"]
         state.nodes_by_id[node_id] = node
         state.base_flow_node_ids.add(node_id)
 
     for edge in state.edges:
-        edge_id, source, target = _require_edge_endpoints(
-            edge,
-            context="flow.data.edges",
-            error_cls=FlowDataValidationError,
-        )
-        if edge_id in state.edges_by_id:
-            msg = f"flow.data.edges: duplicate edge id: {edge_id!r}"
-            raise FlowDataValidationError(msg)
+        edge_id, source, target = edge["id"], edge["source"], edge["target"]
         state.edges_by_id[edge_id] = edge
         state.edge_ids_by_node_id[source].add(edge_id)
         state.edge_ids_by_node_id[target].add(edge_id)
@@ -169,6 +155,7 @@ def _apply_add_nodes(state: GraphState, nodes: list[dict[str, Any]]) -> list[Flo
 
     for index, node in enumerate(nodes):
         node_id = _require_node_id(node, context=f"add_nodes[{index}]")
+        _require_node_objects(node, context=f"add_nodes[{index}]")
         if node_id in seen_in_request:
             msg = f"add_nodes: duplicate node id in request: {node_id!r}"
             raise FlowOperationValidationError(msg)
@@ -224,7 +211,7 @@ def _apply_set_node_field_update(
 ) -> None:
     _validate_node_field_path(update.path, context=f"update_nodes[{index}].path")
     node = _copy_base_flow_node_before_mutation(state, update.id)
-    _set_node_field(node, update.path, update.value, context=f"update_nodes[{index}]")
+    _set_node_field(node, update.path, update.value, from_type=update.from_type, context=f"update_nodes[{index}]")
 
 
 def _apply_delete_node_field_update(
@@ -349,15 +336,58 @@ def _read_json_value_before_last_path_part(
     return json_value
 
 
-def _set_node_field(node: dict[str, Any], path: NodeFieldPath, value: Any, *, context: str) -> None:
+def _set_node_field(
+    node: dict[str, Any],
+    path: NodeFieldPath,
+    value: Any,
+    *,
+    from_type: str | None,
+    context: str,
+) -> None:
     json_value = _read_json_value_before_last_path_part(node, path, context=context)
     last_path_part = path[-1]
+    _check_value_type_change(json_value, last_path_part, value, from_type=from_type, context=context)
     if isinstance(json_value, dict):
         _write_object_path_part(json_value, last_path_part, value, context=context)
         return
     if isinstance(json_value, list):
         _write_array_path_part(json_value, last_path_part, value, context=context)
         return
+
+
+def _check_value_type_change(
+    container: dict[str, Any] | list[Any],
+    path_part: NodeFieldPathSegment,
+    value: Any,
+    *,
+    from_type: str | None,
+    context: str,
+) -> None:
+    """Refuse a set_field that silently changes a value's JSON type.
+
+    A type change must be declared with ``from_type`` naming the type being
+    replaced, which also makes it a precondition: the write only applies to the
+    value it was derived from.
+    """
+    if isinstance(container, dict):
+        exists = isinstance(path_part, str) and path_part in container
+        current = container.get(path_part) if exists else None
+    else:
+        exists = _is_json_array_index(path_part) and 0 <= path_part < len(container)
+        current = container[path_part] if exists else None
+
+    if from_type is None:
+        if exists and json_type(current) != json_type(value):
+            msg = (
+                f"{context}: set_field changes a {json_type(current)} to a {json_type(value)} "
+                "without declaring from_type"
+            )
+            raise FlowOperationValidationError(msg, code="FIELD_TYPE_CHANGE_UNDECLARED")
+        return
+    if not exists or json_type(current) != from_type:
+        found = json_type(current) if exists else "nothing"
+        msg = f"{context}: set_field expected to replace a {from_type} but found {found}"
+        raise FlowOperationValidationError(msg, code="FIELD_TYPE_PRECONDITION_FAILED")
 
 
 def _delete_node_field(node: dict[str, Any], path: NodeFieldPath, *, context: str) -> None:
@@ -502,37 +532,45 @@ def _require_node_id(
     node: Any,
     *,
     context: str,
-    error_cls: type[FlowOperationError] = FlowOperationValidationError,
 ) -> str:
     if not isinstance(node, dict):
         msg = f"{context}: node must be a dict"
-        raise error_cls(msg)
+        raise FlowOperationValidationError(msg)
     node_id = node.get("id")
     if not isinstance(node_id, str) or not node_id:
         msg = f"{context}: node must have a non-empty string id"
-        raise error_cls(msg)
+        raise FlowOperationValidationError(msg)
     return node_id
+
+
+def _require_node_objects(node: dict[str, Any], *, context: str) -> None:
+    value: Any = node
+    for object_path in NODE_OBJECT_PATHS:
+        value = value.get(object_path[-1]) if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            label = ".".join(str(part) for part in object_path)
+            msg = f"{context}: node {label} must be an object"
+            raise FlowOperationValidationError(msg)
 
 
 def _require_edge_endpoints(
     edge: Any,
     *,
     context: str,
-    error_cls: type[FlowOperationError] = FlowOperationValidationError,
 ) -> tuple[str, str, str]:
     if not isinstance(edge, dict):
         msg = f"{context}: edge must be a dict"
-        raise error_cls(msg)
+        raise FlowOperationValidationError(msg)
     edge_id = edge.get("id")
     source = edge.get("source")
     target = edge.get("target")
     if not isinstance(edge_id, str) or not edge_id:
         msg = f"{context}: edge must have a non-empty string id"
-        raise error_cls(msg)
+        raise FlowOperationValidationError(msg)
     if not isinstance(source, str) or not source:
         msg = f"{context}: edge must have a non-empty string source"
-        raise error_cls(msg)
+        raise FlowOperationValidationError(msg)
     if not isinstance(target, str) or not target:
         msg = f"{context}: edge must have a non-empty string target"
-        raise error_cls(msg)
+        raise FlowOperationValidationError(msg)
     return edge_id, source, target
