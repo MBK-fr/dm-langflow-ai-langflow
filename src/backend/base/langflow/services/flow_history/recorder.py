@@ -187,7 +187,7 @@ async def write_flow_graph(
         return result
 
     if not started:
-        session.add(_checkpoint(flow, base, revision=0))
+        session.add(checkpoint_system(flow, base, revision=0))
 
     recorded = _sequence(
         derived.operations, base=base, target=target, flow=flow, actor_id=actor_id, request_id=request_id
@@ -210,6 +210,12 @@ async def write_flow_graph(
     result.end_revision = recorded[-1].revision
     result.latest_revision = flow.latest_revision
     result.current_revision = flow.current_revision
+
+    # Imported here: maintenance builds on this module.
+    from langflow.services.flow_history.maintenance import needs_maintenance, request_maintenance
+
+    if await needs_maintenance(session, flow):
+        request_maintenance(session, flow.id)
     return result
 
 
@@ -244,7 +250,7 @@ async def checkpoint_fields(session: AsyncSession, flow: Flow) -> dict[str, Any]
         return {}
 
 
-def _checkpoint(flow: Flow, flow_data: dict[str, Any], *, revision: int) -> FlowVersion:
+def checkpoint_system(flow: Flow, flow_data: dict[str, Any], *, revision: int) -> FlowVersion:
     """Build a system checkpoint: no version number, never listed or pruned."""
     return FlowVersion(
         flow_id=flow.id,
